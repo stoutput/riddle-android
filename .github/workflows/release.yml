@@ -1,0 +1,258 @@
+name: Release
+
+# Builds and signs the APK, then publishes it as a GitHub Release.
+#
+# The version is whatever riddle-core/Cargo.toml says. Bump it on main and the
+# release happens; if a release for that version already exists, everything is
+# skipped, so pushes that are not version bumps cost nothing.
+#
+# Required repository secrets (Settings → Secrets and variables → Actions):
+#   KEYSTORE_BASE64        base64 of the release .jks file
+#   KEYSTORE_PASSWORD      the keystore password
+#   KEY_ALIAS              the key alias inside it
+#   KEY_PASSWORD           the key password (may equal KEYSTORE_PASSWORD)
+#
+#   base64 -i release.jks | pbcopy      # macOS, straight to the clipboard
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  check-release:
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.check.outputs.should_release }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read the version from the crate
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Only the [package] version, and only unindented keys: the same file
+          # also has `version = "..."` for each dependency.
+          VERSION=$(awk '
+            /^\[/ { in_package = ($0 == "[package]"); next }
+            in_package && /^version[[:space:]]*=/ {
+              gsub(/.*=[[:space:]]*"|".*/, ""); print; exit
+            }' riddle-core/Cargo.toml)
+          if [ -z "$VERSION" ]; then
+            echo "::error::could not read version from riddle-core/Cargo.toml"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Version: $VERSION"
+
+          # Also require the upstream revision marker to exist: a release should
+          # never be cut from a tree that has lost its provenance.
+          test -s riddle-core/UPSTREAM_REVISION || {
+            echo "::error::riddle-core/UPSTREAM_REVISION is missing or empty"
+            exit 1
+          }
+
+          if gh release view "v${VERSION}" &>/dev/null; then
+            echo "Release v${VERSION} already exists — nothing to do."
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "No release for v${VERSION} — will build."
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check the signing secrets are present
+        if: steps.check.outputs.should_release == 'true'
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          # Fail here with a clear message rather than signing with a throwaway
+          # key and publishing an APK nobody can update over.
+          missing=""
+          for name in KEYSTORE_BASE64 KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+            if [ -z "${!name}" ]; then missing="$missing $name"; fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::missing repository secrets:$missing"
+            exit 1
+          fi
+          echo "All four signing secrets are set."
+
+  build:
+    needs: check-release
+    if: needs.check-release.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Cache Rust build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            riddle-core/target
+          key: rust-${{ runner.os }}-${{ hashFiles('riddle-core/Cargo.lock', 'riddle-core/Cargo.toml') }}
+          restore-keys: rust-${{ runner.os }}-
+
+      - name: Install the Android NDK
+        run: |
+          # The runner image has the SDK and its tools but no NDK. latest/ is the
+          # preinstalled layout here, not a cmdline-tools install.
+          SDKMANAGER=$(find "$ANDROID_HOME" -name sdkmanager -type f | head -1)
+          test -n "$SDKMANAGER" || { echo "::error::no sdkmanager on this runner"; exit 1; }
+          yes | "$SDKMANAGER" --install 'ndk;27.0.12077973' > /dev/null
+
+      - name: Unit tests
+        working-directory: riddle-core
+        run: cargo test --lib
+
+      - name: Build and sign the APK
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.0.12077973
+          # A monotonic Android version code: every release run increases it.
+          RIDDLE_VERSION_CODE: ${{ github.run_number }}
+        run: |
+          # Materialise the release key from secrets, and delete it after use.
+          KEYSTORE=/tmp/release.jks
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 --decode > "$KEYSTORE"
+          trap 'rm -f "$KEYSTORE"' EXIT
+
+          RIDDLE_KEYSTORE="$KEYSTORE" \
+          RIDDLE_KEY_ALIAS="${{ secrets.KEY_ALIAS }}" \
+          RIDDLE_KEYSTORE_PASSWORD="${{ secrets.KEYSTORE_PASSWORD }}" \
+          RIDDLE_KEY_PASSWORD="${{ secrets.KEY_PASSWORD }}" \
+            ./scripts/build-apk.sh
+
+      - name: Verify the APK is signed with the release key
+        run: |
+          VERSION="${{ needs.check-release.outputs.version }}"
+          APK="riddle-${VERSION}-arm64-v8a.apk"
+          test -f "$APK" || { echo "::error::$APK was not produced"; exit 1; }
+          # Refuse to publish something apksigner cannot verify.
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -V | tail -1)
+          "$APKSIGNER" verify --print-certs "$APK"
+
+      - name: Checksums
+        run: |
+          VERSION="${{ needs.check-release.outputs.version }}"
+          sha256sum "riddle-${VERSION}-arm64-v8a.apk" > "riddle-${VERSION}-arm64-v8a.apk.sha256"
+          cat "riddle-${VERSION}-arm64-v8a.apk.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: riddle-apk
+          path: |
+            riddle-*-arm64-v8a.apk
+            riddle-*-arm64-v8a.apk.sha256
+          if-no-files-found: error
+
+  release:
+    needs: [check-release, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: riddle-apk
+          path: artifacts
+
+      - name: Stage the release files
+        run: |
+          VERSION="${{ needs.check-release.outputs.version }}"
+          ls -la artifacts
+          cp "artifacts/riddle-${VERSION}-arm64-v8a.apk" .
+          cp "artifacts/riddle-${VERSION}-arm64-v8a.apk.sha256" .
+
+      - name: Generate release notes
+        run: |
+          VERSION="${{ needs.check-release.outputs.version }}"
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          UPSTREAM=$(cat riddle-core/UPSTREAM_REVISION)
+
+          {
+            echo "## The Diary v${VERSION} (Android)"
+            echo ""
+            echo "Write on the page with a pen; after a pause the diary drinks your ink"
+            echo "and Tom writes back by hand, stroke by stroke."
+            echo ""
+            echo "**Install:** download the APK below and open it, or"
+            echo "\`adb install -r riddle-${VERSION}-arm64-v8a.apk\`."
+            echo "Then open **Settings** and add an OpenAI-compatible API key."
+            echo ""
+
+            if [ -n "$PREV_TAG" ]; then
+              COMMIT_COUNT=$(git rev-list --count "${PREV_TAG}..HEAD")
+              FILE_COUNT=$(git diff --name-only "${PREV_TAG}..HEAD" | wc -l | tr -d ' ')
+              echo "**${COMMIT_COUNT} commits**, **${FILE_COUNT} files changed** since ${PREV_TAG}"
+            else
+              echo "**$(git rev-list --count HEAD) commits** (initial release)"
+            fi
+            echo ""
+
+            echo "### Artifacts"
+            echo ""
+            echo "| File | Description |"
+            echo "| --- | --- |"
+            echo "| \`riddle-${VERSION}-arm64-v8a.apk\` | The diary (arm64-v8a, Android 7.0+) |"
+            echo "| \`riddle-${VERSION}-arm64-v8a.apk.sha256\` | Checksum |"
+            echo ""
+
+            echo "### Changes"
+            RANGE="${PREV_TAG:+${PREV_TAG}..HEAD}"
+            RANGE="${RANGE:-HEAD}"
+
+            FEATS=$(git log --pretty=format:"- %s" --no-merges "$RANGE" | grep -iE "^- (add|feat|new|support|implement)" | head -20)
+            if [ -n "$FEATS" ]; then echo ""; echo "**New Features**"; echo "$FEATS"; fi
+
+            FIXES=$(git log --pretty=format:"- %s" --no-merges "$RANGE" | grep -iE "^- (fix|bug|patch|resolve|correct)" | head -20)
+            if [ -n "$FIXES" ]; then echo ""; echo "**Bug Fixes**"; echo "$FIXES"; fi
+
+            OTHER=$(git log --pretty=format:"- %s (%h)" --no-merges "$RANGE" | grep -viE "^- (add|feat|new|support|implement|fix|bug|patch|resolve|correct)" | head -20)
+            if [ -n "$OTHER" ]; then echo ""; echo "**Other**"; echo "$OTHER"; fi
+
+            echo ""
+            echo "---"
+            echo "An Android port of [MaximeRivest/riddle](https://github.com/MaximeRivest/riddle),"
+            echo "built from upstream \`${UPSTREAM:0:12}\`. MIT licensed; see NOTICE."
+            echo ""
+            echo "*Built from \`${GITHUB_SHA::8}\` on $(date -u +%Y-%m-%d)*"
+          } > /tmp/release_notes.md
+
+          cat /tmp/release_notes.md
+
+      - name: Create the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "v${{ needs.check-release.outputs.version }}"
+          name: "The Diary v${{ needs.check-release.outputs.version }}"
+          body_path: /tmp/release_notes.md
+          draft: false
+          prerelease: ${{ contains(needs.check-release.outputs.version, '-') }}
+          files: |
+            riddle-${{ needs.check-release.outputs.version }}-arm64-v8a.apk
+            riddle-${{ needs.check-release.outputs.version }}-arm64-v8a.apk.sha256

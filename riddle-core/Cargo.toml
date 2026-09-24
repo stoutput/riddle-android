@@ -1,0 +1,30 @@
+[package]
+name = "riddle"
+# Ported from upstream 0.3.0. This number is this repository's own: releasing
+# means bumping it and pushing to main (see .github/workflows/release.yml).
+version = "0.4.0"
+edition = "2021"
+license = "MIT"
+description = "The diary of Tom Riddle — Android port"
+publish = false
+
+# cdylib: loaded by the Android activity through JNI.
+# rlib: keeps the ported modules unit-testable on the host with `cargo test`.
+[lib]
+name = "riddle"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+libc = "0.2"
+png = "0.17"
+ab_glyph = "0.2"
+jni = "0.21"
+# HTTP + TLS for the OpenAI-compatible oracle backend. Pure Rust (rustls),
+# no OpenSSL/C — the reason this cross-compiles to Android cleanly.
+ureq = { version = "2.10", default-features = false, features = ["tls"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+panic = "abort"

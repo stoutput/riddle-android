@@ -1,0 +1,64 @@
+name: Tests
+
+# Fast feedback on every change. The full APK build lives in release.yml; this
+# job only needs Rust, so it runs quickly and can gate pull requests that touch
+# the engine.
+#
+# The engine is the part worth testing: the ported handwriting pipeline, the
+# memory store, the streaming reply parser, and the state machine. The Android
+# layer is deliberately thin enough to verify by hand.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            riddle-core/target
+          key: test-${{ runner.os }}-${{ hashFiles('riddle-core/Cargo.lock') }}
+          restore-keys: test-${{ runner.os }}-
+
+      - name: Unit tests
+        working-directory: riddle-core
+        run: cargo test --lib
+
+      # --all-targets, not --lib: the host harness in examples/ has to keep
+      # compiling, and it is the quickest way to look at a rendered page.
+      - name: Clippy
+        working-directory: riddle-core
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build the host harness
+        working-directory: riddle-core
+        run: cargo build --example dump_page
+
+# Deliberately NOT checked here: `cargo fmt`.
+#
+# Upstream riddle is not rustfmt-formatted, and this port preserves that on
+# purpose. Three of the vendored files (script.rs, ink.rs, fb.rs) are still
+# byte-identical to upstream, and a handful of others are near it — which is
+# what makes a future `git diff` against upstream readable, and what will make
+# rebasing onto a new upstream revision tractable. Running rustfmt would churn
+# ~1350 lines across files nobody has touched, for no functional gain.
+#
+# If that trade-off ever stops being worth it, run `cargo fmt` in one commit of
+# its own, drop the note, and add the check back here.

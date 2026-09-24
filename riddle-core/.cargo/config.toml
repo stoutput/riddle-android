@@ -1,0 +1,12 @@
+# Android cross-compilation settings.
+#
+# Only the explicit aarch64-linux-android target is configured here, so host
+# builds (cargo test, build scripts, proc macros) are unaffected and still use
+# the macOS linker.
+#
+# `linker` points at the NDK's clang wrapper. The exact name carries the
+# minimum-API suffix, so scripts/build-native.sh rewrites this line for the
+# detected NDK; the value below matches ANDROID_MIN_SDK=24.
+[target.aarch64-linux-android]
+linker = "aarch64-linux-android24-clang"
+rustflags = ["-C", "link-arg=-Wl,--build-id=sha1"]
