@@ -1,0 +1,77 @@
+# NOTICE
+
+This repository is an Android port of **riddle** by Maxime Rivest:
+
+> https://github.com/MaximeRivest/riddle
+
+Pinned to upstream revision `0d1a9feea75027543e2ed49c721656cd261f03a1`
+(version 0.3.0). That exact revision is recorded in
+`riddle-core/UPSTREAM_REVISION` and is what the port was diffed against.
+
+## License
+
+Upstream is MIT licensed, and the `LICENSE` file in this repository is
+upstream's, reproduced verbatim — it carries Maxime Rivest's copyright, which
+the MIT terms require to be preserved for the derived portions of this work:
+
+    MIT License
+    Copyright (c) 2026 Maxime Rivest
+
+The Android port — the platform layer, the JNI bridge, the Android UI, the
+build scripts, and the CI workflows — is additionally:
+
+    Copyright (c) 2026 stoutput
+
+and is released under the same MIT terms. See `LICENSE` for the full text.
+
+## What is derived from upstream, and what is new
+
+Measured by diffing this tree against the pinned revision.
+
+**Taken from upstream, unmodified** (`+0 −0` lines):
+
+| File | Lines | What it does |
+|---|---|---|
+| `riddle-core/src/script.rs` | 241 | Rasterize text, Zhang–Suen thinning, stroke tracing, word wrap |
+| `riddle-core/src/ink.rs` | 223 | Pen stroke capture, the erase-and-forget model, the dissolve effect |
+| `riddle-core/src/fb.rs` | 41 | Page geometry and the bounding-box helper |
+
+**Derived from upstream, with changes:**
+
+| File | Upstream lines | Changed | Nature of the change |
+|---|---|---|---|
+| `riddle-core/src/surface.rs` | 201 | +53 −2 | Added an engine-owned RGB565 buffer (`new_owned`, `pixels`) |
+| `riddle-core/src/help.rs` | 376 | +43 −3 | Added the Android gesture list; the display mode became an enum |
+| `riddle-core/src/memory.rs` | 369 | +38 −10 | Storage location moved from `/home/root` to app-private storage; added `forget_all` |
+| `riddle-core/src/oracle.rs` | 899 | +39 −216 | Removed the `pi`/Node backend; configuration now comes from settings |
+
+**New in this port** (no upstream counterpart):
+
+- `riddle-core/src/app.rs` — the diary's state machine, reworked from upstream's
+  `main.rs` to be driven by Android instead of a blocking `loop {}`.
+- `riddle-core/src/lib.rs` — JNI entry points, the engine thread, the frame
+  handoff.
+- `riddle-core/src/config.rs` — the `KEY=value` settings store that replaces
+  upstream's `oracle.env` and `RIDDLE_*` environment variables.
+- `riddle-core/examples/dump_page.rs` — host-side page renderer.
+- The whole of `android/` — Java UI, manifest, resources.
+- The whole of `scripts/`, `env.sh`, and `.github/`.
+
+**Deleted from upstream** (reMarkable-specific, replaced by the Android
+platform APIs): `main.rs`, `display.rs`, `qtfb.rs`, `pen.rs`, `touch.rs`,
+`power.rs`, and the `build.rs` / `build-takeover.sh` / `scripts/` from
+upstream's own tree.
+
+## Third-party components
+
+| Component | License | Note |
+|---|---|---|
+| Dancing Script font (`riddle-core/fonts/`) | SIL OFL 1.1 | See `riddle-core/fonts/OFL.txt`. From [googlefonts/DancingScript](https://github.com/googlefonts/DancingScript). |
+| Rust crates | per crate | `ab_glyph`, `png`, `ureq`, `rustls`, `jni`, `libc` — see `riddle-core/Cargo.lock` |
+
+## Not included, and not used
+
+Upstream's reMarkable-only pieces are **not** part of this port and are not
+distributed here: `libqsgepaper.so`, Qt, and `libquill.so` are proprietary,
+come from the device or a vendor SDK, and upstream does not redistribute them
+either. This port touches none of them — it draws with Android's own canvas.

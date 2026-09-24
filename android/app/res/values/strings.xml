@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">The Diary</string>
+
+    <!-- Main screen chrome -->
+    <string name="eraser">Erase</string>
+    <string name="eraser_on">Erasing</string>
+    <string name="settings">Settings</string>
+    <string name="settings_applied">The diary will open again with the new settings.</string>
+
+    <!-- Failure states. The engine is the only thing that can draw, so these
+         are the only explanations the writer can get. -->
+    <string name="native_missing">This build does not include the diary engine for this device\'s processor.\n\nInstall the arm64-v8a build.</string>
+    <string name="engine_failed">The diary could not open. Check the log for details:\n\nadb logcat -s riddle</string>
+
+    <!-- Settings -->
+    <string name="settings_oracle_heading">The oracle</string>
+    <string name="settings_oracle_help">The diary reads your handwriting and sends it to a vision model, then writes the reply back by hand. Any OpenAI-compatible endpoint works. Without a key the diary still opens, but it cannot answer.</string>
+    <string name="settings_api_key">API key</string>
+    <string name="settings_api_key_hint">sk-…</string>
+    <string name="settings_base">Endpoint base URL</string>
+    <string name="settings_model">Model</string>
+    <string name="settings_reasoning">Reasoning effort</string>
+    <string name="settings_reasoning_hint">low — thinking models only</string>
+    <string name="settings_max_tokens">Max reply tokens</string>
+    <string name="settings_test">Test</string>
+    <string name="settings_testing">Asking the oracle…</string>
+    <string name="settings_test_empty">The oracle answered nothing. Check the key, endpoint and model.</string>
+    <string name="settings_save">Save</string>
+    <string name="settings_cancel">Cancel</string>
+    <string name="settings_no_key">No API key: the diary will open but cannot answer.</string>
+    <string name="settings_write_failed">Could not save settings: %1$s</string>
+
+    <string name="settings_memory_heading">Memory</string>
+    <string name="settings_memory_on">Let the diary remember</string>
+    <string name="settings_memory_help">Every finished page is kept on this device — your strokes, a transcription, and Tom\'s reply — so you can ask to see a past page again. Nothing else is stored, and turning this off sends no history with a request.</string>
+    <string name="settings_tz">Hours from UTC (for remembered dates)</string>
+    <string name="settings_tz_hint">e.g. -6, or 5.5</string>
+
+    <string name="settings_forget">Forget everything</string>
+    <string name="settings_forget_help">Deletes every remembered page from this device. The diary cannot get them back.</string>
+    <string name="settings_forget_confirm">Delete every remembered page? This cannot be undone.</string>
+    <string name="settings_forgotten">The diary has forgotten.</string>
+</resources>
