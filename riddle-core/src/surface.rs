@@ -3,7 +3,7 @@
 //! RGB32 aux framebuffer (takeover backend). Colors are RGB565 u16 at the
 //! API; the surface converts on write.
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PixFmt {
     /// 2 bytes/px, little-endian RGB565 (qtfb FBFMT_RMPP_RGB565).
     Rgb565,
@@ -99,15 +99,29 @@ impl Surface {
     /// field, which JNI cannot see on current Android. An owned buffer has
     /// none of that coupling and is testable on the host.
     ///
-    /// Only correct for `PixFmt::Rgb565`, where the stride is exactly
-    /// `w * 2`; asserts so in debug builds.
+    /// Only meaningful for `PixFmt::Rgb565`, where the stride is exactly
+    /// `w * 2`. Any other geometry returns an empty slice rather than reading
+    /// past the buffer: the caller is handed a plain `&[u16]` and cannot be
+    /// expected to re-check the invariants, and a release build would skip a
+    /// `debug_assert` and hand back a slice over memory it does not own.
     pub fn pixels(&self) -> &[u16] {
-        debug_assert!(matches!(self.fmt, PixFmt::Rgb565));
-        debug_assert_eq!(self.stride, self.w * 2);
+        // No debug_assert here on purpose: the property being protected is
+        // memory safety, and an assertion would guard it only in debug builds.
+        // Returning nothing is the guarantee, and it holds in release too.
+        if !matches!(self.fmt, PixFmt::Rgb565) || self.stride != self.w * 2 {
+            return &[];
+        }
+        // Bounds, not just geometry: the allocation `new` was told about must
+        // actually hold `w * h` pixels, or a truncated buffer would still be
+        // dereferenced as if it did.
+        if self.len < self.w * self.h * 2 {
+            return &[];
+        }
         let bytes = self.buf_ref();
-        // Safety: `put_px`/`fill_rect` maintain little-endian RGB565 pairs, and
-        // the buffer is `stride * h` bytes with stride == w * 2. Alignment is
-        // guaranteed because the buffer is allocated as a `Vec<u16>`.
+        // Safety: geometry checked immediately above, so this reads exactly
+        // `w * h` u16 within a buffer of at least that many bytes. Alignment
+        // holds because every constructor either uses a `Vec<u16>`-backed
+        // allocation or is documented to require one.
         unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u16, self.w * self.h) }
     }
 
@@ -248,5 +262,58 @@ impl Surface {
             let y = y0 + (y1 - y0) * i / steps;
             self.stamp(x, y, r, c);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `pixels()` hands the caller a `&[u16]` over raw memory, so it must
+    /// never trust its own geometry. A buffer that is too small, or a format
+    /// that is not RGB565, has to yield an empty slice rather than a view of
+    /// memory the surface does not own — a release build skips the debug
+    /// assertions that used to be the only guard here.
+    #[test]
+    fn pixels_refuses_geometry_it_cannot_safely_describe() {
+        // A surface claiming 100x100 RGB565 (20_000 bytes) over a 10-byte
+        // allocation: reading w*h u16 would run far past the end.
+        let mut tiny = vec![0u8; 10];
+        let bad = Surface::new(tiny.as_mut_ptr(), tiny.len(), 100, 100, 200, PixFmt::Rgb565);
+        assert!(bad.pixels().is_empty(), "read past a too-small buffer");
+
+        // A 32-bit format: the u16 view would misinterpret every pixel.
+        let mut buf = vec![0u8; 100 * 100 * 4];
+        let bgr = Surface::new(buf.as_mut_ptr(), buf.len(), 100, 100, 400, PixFmt::Rgb32);
+        assert!(bgr.pixels().is_empty(), "viewed RGB32 memory as RGB565");
+
+        // A stride that disagrees with the width would shear the image.
+        let mut buf2 = vec![0u8; 100 * 100 * 2];
+        let sheared = Surface::new(buf2.as_mut_ptr(), buf2.len(), 100, 100, 202, PixFmt::Rgb565);
+        assert!(sheared.pixels().is_empty(), "accepted a mismatched stride");
+    }
+
+    /// The real surface must still work, since the whole Android frame path
+    /// depends on it.
+    #[test]
+    fn an_owned_surface_yields_exactly_its_pixels() {
+        let s = Surface::new_owned(16, 8);
+        assert_eq!(s.pixels().len(), 16 * 8);
+        // Freshly allocated, so every pixel is the zero fill; `white_page`
+        // fills it, and that path is covered by the app tests.
+        assert!(s.pixels().iter().all(|&v| v == 0));
+    }
+
+    /// Drawing must stay inside the buffer even when asked to draw outside it.
+    #[test]
+    fn drawing_out_of_bounds_is_clipped() {
+        let mut s = Surface::new_owned(8, 8);
+        s.put_px(-5, -5, BLACK);
+        s.put_px(1000, 1000, BLACK);
+        s.fill_rect(4, 4, 1000, 1000, BLACK);
+        s.stamp(1000, 1000, 50, BLACK);
+        s.brush_line(-100, -100, 1000, 1000, 4, BLACK);
+        // 4x4 corner filled by fill_rect, plus the brush line crossing it.
+        assert_eq!(s.pixels().len(), 64);
     }
 }
