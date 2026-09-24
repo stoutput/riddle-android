@@ -1,64 +1,118 @@
 # riddle for Android
 
-The diary of Tom Riddle, ported to Android. Write on the page with a pen; after
-a pause the diary drinks your ink, thinks, and writes its answer back by hand,
-stroke by stroke.
+The diary of Tom Riddle, for Android. Write on the page with a pen; after a
+pause the diary drinks your ink, thinks for a moment, and an answer writes
+itself back in a flowing hand, stroke by stroke, then fades away.
 
-This is a port of [MaximeRivest/riddle](https://github.com/MaximeRivest/riddle)
-(revision `0d1a9feea75027543e2ed49c721656cd261f03a1`, version 0.3.0), which
-targets the **reMarkable Paper Pro** — a 1620×2160 e-ink tablet. Upstream is a
-Rust binary that talks to the tablet's display engine directly and runs as root
-under systemd. None of that exists inside an APK, so the platform layer was
-replaced while the diary itself was kept.
+No screen glow, no keyboard, no chat UI. Just ink appearing on paper.
 
-- **Download:** grab the APK from the
-  [latest release](../../releases/latest), or build it yourself (below)
-- **Package:** `com.stoutput.riddleandroid` · arm64-v8a · Android 7.0+ (minSdk 24)
+- **Download:** grab the APK from the [latest release](../../releases/latest)
+- **Requires:** an arm64 Android device, Android 7.0+ (minSdk 24), and an
+  OpenAI-compatible API key for the diary to answer
 - **Install:** `adb install -r riddle-<version>-arm64-v8a.apk`
 
-Upstream's handwriting engine is reused, not reimplemented — see
-[NOTICE](NOTICE) for exactly which files came from where.
+> This repo is based on the work of **MaximeRivest**, here:
+> <https://github.com/MaximeRivest/riddle>. The handwriting engine is his; this
+> project builds an Android app around it. See [NOTICE](NOTICE) for what came
+> from where.
 
-## What was kept, and what was replaced
+## How it works
 
-The interesting part of upstream is not the platform plumbing — it is the
-handwriting. `script.rs` rasterizes text in Dancing Script, thins it to
-one-pixel skeletons with Zhang–Suen, traces those skeletons into ordered
-polylines, and replays them stroke by stroke so the reply looks written rather
-than printed. That, the ink model, the dissolve effect, the memory store, the
-question-mark detector, and the oracle client are all device-agnostic and were
-ported unchanged.
+```
+ pen (MotionEvent, full stylus pressure)
+   │ strokes
+   ▼
+ riddle ── idle 2.8s → commit page → PNG ──► oracle (any OpenAI-compatible
+   │                                          endpoint, streams the reply
+   ▼                                          sentence by sentence)
+ strokes (Dancing Script → thinned to single-pixel pen paths → traced)
+   │
+   ▼
+ Android Canvas
+```
 
-| Upstream module | Disposition |
+A pen stroke is drawn the moment it arrives, at the hardware event rate. When
+you stop writing for ~2.8s the page is committed: the ink is rasterized to a
+small grayscale PNG and sent to a vision model, and the reply comes back as
+text that is then *written* — rasterized in Dancing Script, thinned to
+single-pixel skeletons with Zhang–Suen, traced into ordered polylines, and
+replayed stroke by stroke so it looks written rather than printed.
+
+The model never sees the screen, only your handwriting. Everything else is
+local.
+
+### Deliberate scope
+
+The diary is a page of paper, not an app with a chat log:
+
+- **The oracle is any OpenAI-compatible endpoint** — OpenAI, OpenRouter, Groq,
+  a local server. Pure-Rust HTTPS via `ureq` + `rustls`, no extra libraries.
+  There is no built-in `pi`/Node backend: an Android app sandbox cannot host a
+  resident Node process.
+- **No e-ink waveform handling.** This draws to an LCD or OLED panel, so every
+  update is a plain repaint.
+- **No takeover mode.** The diary is an ordinary app; it does not stop the rest
+  of the system or own the power button.
+
+## The diary remembers
+
+Every finished page is kept — your actual pen strokes, a transcription, and
+Tom's reply — so the diary can do three things:
+
+- **Follow the conversation.** Recent pages ride along with each request, so
+  Tom remembers what you wrote yesterday.
+- **Conjure the past.** Ask in ink — *"show me the page about the garden"*,
+  *"find what I wrote on Tuesday"* — and the diary rewrites that page in front
+  of you, in your own hand, dated, in faded ink. Touch the pen anywhere and
+  today's page returns.
+- **Answer from memory.** *"What do you remember?"* gets a handwritten index.
+
+Memories live only on the device, in the app's private storage. Turning
+remembering off in settings stores nothing and sends no history with a request;
+**Forget everything** deletes what is there.
+
+The page image is deleted as soon as the oracle has read it. Nothing else ever
+leaves the device, and there is no telemetry.
+
+## Gestures
+
+| Do this | And |
 |---|---|
-| `surface.rs`, `fb.rs`, `ink.rs`, `script.rs`, `help.rs`, `memory.rs` | Ported; `surface` gained an owned RGB565 buffer |
-| `oracle.rs` | Kept the HTTP backend; the `pi` backend was dropped (see below) |
-| `main.rs` | Replaced by `app.rs` — the same state machine, driven by Android instead of a `loop {}` |
-| `display.rs`, `qtfb.rs`, `pen.rs`, `touch.rs`, `power.rs` | **Deleted.** Android supplies the display and input |
+| Write, then rest the pen | The diary drinks your ink and Tom replies |
+| Write *"show me what I wrote about…"* | The remembered page rises through the paper |
+| Write *"what do you remember?"* | Tom answers with a handwritten index |
+| Use the eraser tip, or the **Erase** button | Rub ink out (erased ink is also forgotten) |
+| Draw a large **?** | Summon the guide |
+| Hold the pen still for ~1.5s on the page | Open settings |
+| Tap five fingers at once | Open settings |
+| **Settings** button | Open settings |
 
-### Why the `pi` backend is gone
+The guide is shown on first launch when no API key is set, so the diary
+explains itself instead of sitting blank.
 
-Upstream can drive its oracle either over HTTP or through `pi`, a resident Node
-RPC process. The second needs a Node install, a writable `/home/root`, and a
-long-lived child process — none of which an Android app sandbox provides. The
-HTTP backend (any OpenAI-compatible endpoint, pure-Rust HTTPS via `ureq` +
-`rustls`) is upstream's own recommended default, so that is what shipped. Any
-vision-capable model works.
+## Configuration
 
-### Why the engine owns its pixels
+All of it lives in the settings screen, and is stored in the app's private
+directory as a `KEY=value` file that the engine reads at startup:
 
-The Rust engine draws into a buffer it owns, and the view copies it into a
-`Bitmap` after each dirty frame (`nativeCopyPixels`). Drawing straight into the
-bitmap from native code would be the obvious approach, but:
+| Setting | Default |
+|---|---|
+| API key | *(none — the diary opens but cannot answer)* |
+| Endpoint base URL | `https://api.openai.com/v1` |
+| Model | `gpt-4o-mini` (must be vision-capable) |
+| Reasoning effort | *(unset — for thinking models, `low` gives faster first ink)* |
+| Max reply tokens | `2000` |
+| Let the diary remember | on |
+| Hours from UTC | *(unset — used for remembered dates)* |
 
-- `AndroidBitmap_lockPixels` lives in `libjnigraphics` behind a C header, which
-  would put a C stub in an otherwise pure-Rust library; and
-- `Bitmap.mBuffer` (the field the NDK helper wraps) is **not visible to JNI on
-  current Android** — `GetFieldID` fails on it, which is how the first build of
-  this port died.
+**Test** asks the oracle for one reply from a blank page and shows it, which is
+the quickest way to tell a bad key from a bad model name.
 
-An owned buffer has neither problem, and it makes the engine testable on the
-host without a device (see `examples/dump_page.rs`).
+Two gotchas with thinking models (Gemini 3.x, o-series): set reasoning effort to
+`low` for faster first ink, and keep the token cap roomy — hidden reasoning
+tokens count against it, and a tight cap starves the visible reply.
+
+Settings are read once at startup, so changing them reopens the diary.
 
 ## Building
 
@@ -147,129 +201,35 @@ pull request.
 The app is two activities, five small Java classes, and a Rust library. The build
 script drives `aapt2`, `javac`, `d8`, `zipalign` and `apksigner` directly, which
 keeps the whole build readable and means the only things to install are an NDK
-and a JDK. There is no AndroidX dependency, so the APK has no support-library
-weight. If this ever grows a second screen or a background service, moving to
-Gradle would be the right call.
+and a JDK. There is no AndroidX dependency, so the APK carries no
+support-library weight. If this ever grows a second screen or a background
+service, moving to Gradle would be the right call.
 
-## Configuration
+## How it is put together
 
-Upstream read its settings from `oracle.env` and `RIDDLE_*` environment
-variables, sourced by a launch script. An APK has no launch script, so the
-settings screen owns them. It writes a `KEY=value` file
-(`files/riddle.env`, app-private) that the engine reads once at startup — the
-same variable names as upstream, so anyone who knows `oracle.env` already knows
-what these mean.
+The drawing code and the Android UI are separated on purpose: the engine is
+plain Rust over its own pixel buffer, and the Java layer is thin enough to
+verify by hand.
 
-| Setting | Upstream equivalent |
-|---|---|
-| API key | `RIDDLE_OPENAI_KEY` |
-| Endpoint base URL | `RIDDLE_OPENAI_BASE` |
-| Model | `RIDDLE_OPENAI_MODEL` |
-| Reasoning effort | `RIDDLE_OPENAI_REASONING` |
-| Max reply tokens | `RIDDLE_OPENAI_MAX_TOKENS` |
-| Let the diary remember | `RIDDLE_MEMORY` |
-| Hours from UTC | `RIDDLE_TZ_OFFSET` |
-
-**Test** on the settings screen runs upstream's `riddle --oracle-test` against a
-blank page and shows the reply, which is the quickest way to tell a bad key from
-a bad model name. On the tablet that diagnostic was only reachable over SSH.
-
-Settings are read once at startup, so changing them reopens the diary.
-
-## Gestures
-
-| Do this | And |
-|---|---|
-| Write, then rest the pen | The diary drinks your ink and Tom replies |
-| Write *"show me what I wrote about…"* | The remembered page rises through the paper |
-| Write *"what do you remember?"* | Tom answers with a handwritten index |
-| Use the eraser tip, or the **Erase** button | Rub ink out (erased ink is also forgotten) |
-| Draw a large **?** | Summon the guide |
-| Hold the pen still for ~1.5s on the page | Open settings |
-| Tap five fingers at once | Open settings (the tablet's exit gesture, reused) |
-| **Settings** button | Open settings |
-
-The guide panel is shown on first launch when no API key is configured, so the
-diary explains itself instead of sitting blank.
-
-## Differences from the reMarkable build
-
-These are deliberate, and are the places where the port is *not* upstream:
-
-- **The e-ink waveform modes are gone.** Upstream selected between a fast
-  waveform for ink and a flashing full refresh to clear ghosting. An LCD has no
-  ghosting, so every update is a plain repaint.
-- **No takeover mode.** Upstream could stop the tablet's whole UI and drive the
-  display engine directly for the lowest possible latency, and its five-finger
-  tap exited the app. Here the diary is an ordinary app; five fingers is a
-  shortcut into settings instead.
-- **No power-button sleep page.** Upstream grabbed the power button, drew
-  "The diary sleeps.", and suspended the tablet itself. Android backgrounds the
-  app instead, so there is no page to draw.
-- **The `pi` oracle backend is gone** (above).
-- **The guide's gesture list says what the Android build actually does.**
-
-## How this was verified
-
-Built for `arm64-v8a` and run on an Android 14 (API 34) emulator:
-
-- The APK installs, launches, and renders the opening guide — pixel-identical to
-  the same page rendered on the host by `examples/dump_page.rs`.
-- Pen input inks: injected strokes stay on the page.
-- The idle commit works: after ~2.8s the page becomes a turn. With no oracle
-  configured, upstream's rule holds — the writing is **kept** and the reason is
-  written below it, rather than being drunk by something that cannot answer.
-- The reply animation runs to completion in the synthesized hand.
-- The reply then fades out over 10 stages, leaving the writer's ink.
-- The settings screen opens from both the toolbar and the in-page affordance.
-- `scripts/build-apk.sh --debug` produces a debuggable build whose
-  `files/riddle.log` can be read with `run-as` (see below).
-
-32 unit tests pass (`cargo test`), covering the ported handwriting pipeline, the
-memory store, the SSE/stream parser, the eraser's stroke splitting, and the
-config parser — plus regressions for the two bugs this port hit: `start()`
-erasing the opening page, and `step()` discarding the damage it had drawn.
-
-### Logging
-
-The engine logs to logcat under the tag `riddle` **and** to `files/riddle.log`.
-The file exists because the emulator used to verify this port filters app tags
-out of logcat entirely — no app log line is ever visible there — which turned
-"blank page" into an unanswerable question:
-
-```sh
-adb shell run-as com.stoutput.riddleandroid cat files/riddle.log   # needs --debug build
-adb logcat -s riddle                                            # on a normal device
-```
-
-## Known limitations
-
-- **arm64-v8a only.** No `armeabi-v7a` or `x86_64` build. Every current Android
-  tablet with a pen is 64-bit ARM; an emulator testing this app needs an arm64
-  image.
-- **Not verified against a real vision model.** The oracle path is exercised up
-  to the request being issued; answering needs your API key. Use **Test** in
-  settings to confirm the endpoint end-to-end.
-- **No stylus hardware was available**, so pressure response was exercised with
-  a fixed mid-pressure nib (which is also what a finger or mouse provides). Real
-  stylus pressure maps through unchanged from upstream's 0–4096 scale, but that
-  mapping has not been checked against a physical pen.
-- **Rotation is pinned to portrait**, which is how the 1620×2160 page is
-  proportioned. Landscape would need a reflow of the page geometry.
-- **No launcher icon of its own.** Upstream ships only a 256×256 `icon.png`,
-  which is scaled into the density buckets; a proper adaptive icon would be
-  better.
-
-## Layout
+The engine owns the page pixels; `DiaryView` copies them into a `Bitmap` after
+each dirty frame. Drawing straight into the bitmap from native code would be the
+obvious approach, but `AndroidBitmap_lockPixels` lives in `libjnigraphics`
+behind a C header, and `Bitmap.mBuffer` — the field the NDK helper wraps — is not
+visible to JNI on current Android. An owned buffer has neither problem, and it
+keeps the engine testable on the host without a device.
 
 ```
 riddle-core/            Rust engine (cdylib, loaded by JNI)
-  src/app.rs            the diary's state machine, ported from main.rs
-  src/lib.rs            JNI entry points and the frame handoff
-  src/config.rs         the settings store that replaces oracle.env
-  src/{surface,ink,script,help,memory,oracle}.rs   ported from upstream
+  src/app.rs            the diary's state machine
+  src/lib.rs            JNI entry points, the engine thread, the frame handoff
+  src/config.rs         the settings store
+  src/surface.rs        the page buffer and drawing primitives
+  src/ink.rs            stroke capture, erase-and-forget, the dissolve effect
+  src/script.rs         text → strokes: rasterize, thin, trace, wrap
+  src/oracle.rs         the streaming OpenAI-compatible client
+  src/memory.rs         remembered pages, on disk
+  src/help.rs           the guide panel
   examples/dump_page.rs render a page on the host, for inspection
-  UPSTREAM_REVISION     the upstream commit this was ported from
 android/app/            the Android module
   src/.../DiaryView.java      the page: bitmap, scaling, MotionEvent decoding
   src/.../MainActivity.java   the page, plus the Erase and Settings buttons
@@ -281,19 +241,38 @@ scripts/                build-native.sh, build-apk.sh, make-debuggable-manifest.
 env.sh                  toolchain discovery
 ```
 
+### Diagnosing a problem
+
+The engine logs to logcat under the tag `riddle`, and mirrors every line to
+`files/riddle.log`. The file exists because some devices drop app tags from
+logcat entirely, where a blank page is otherwise unanswerable:
+
+```sh
+adb logcat -s riddle                                            # normal case
+adb shell run-as com.stoutput.riddleandroid cat files/riddle.log  # needs --debug
+```
+
+`cargo run --example dump_page -- guide|reply|ink` renders a page on the host
+and writes it to a PNG, which is the quickest way to tell a drawing bug from a
+frame-delivery bug.
+
+## Limitations
+
+- **arm64-v8a only.** No 32-bit or x86_64 build. An emulator needs an arm64
+  image.
+- **Rotation is pinned to portrait**, which is how the 1620×2160 page is
+  proportioned. Landscape would need the page geometry reflowed.
+- **The oracle needs a vision-capable model.** One that cannot see images will
+  answer as though the page were blank.
+- **The launcher icon is upscaled** from a single 256×256 source; a proper
+  adaptive icon would be better.
+
 ## Credits and license
 
-Upstream [riddle](https://github.com/MaximeRivest/riddle) is by **Maxime
-Rivest**, MIT licensed. The handwriting engine — rasterizing text in Dancing
-Script, thinning it to single-pixel skeletons, tracing those into strokes, and
-replaying them — is his work, reused here rather than reimplemented.
-
-MIT. `LICENSE` is upstream's, reproduced verbatim with his copyright; this port
-adds its own copyright under the same terms. [NOTICE](NOTICE) records exactly
-which files came from upstream, which were modified, and which are new.
+MIT. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
 The Dancing Script font is SIL OFL 1.1 — see `riddle-core/fonts/OFL.txt`.
 
-Upstream's reMarkable-only components (`libqsgepaper.so`, Qt, `libquill.so`) are
-proprietary, are not distributed there, and are not used here at all.
-
+Vendor components from the reMarkable ecosystem (`libqsgepaper.so`, Qt,
+`libquill.so`) are proprietary and are not part of this repo. This app draws
+with Android's own canvas and uses none of them.
