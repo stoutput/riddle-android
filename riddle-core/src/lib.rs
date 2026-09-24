@@ -54,6 +54,24 @@ struct Shared {
     pixels: Mutex<Option<Vec<u16>>>,
 }
 
+/// Take a lock, ignoring poisoning.
+///
+/// The guarded values are a command queue and a frame buffer: plain data with
+/// no invariant a panic could have left half-updated. `unwrap()` here would
+/// instead turn a poisoned lock — that is, an earlier panic elsewhere — into a
+/// *second* panic inside a JNI entry point, which unwinds across the JNI
+/// boundary (undefined behaviour, and an abort in practice). Recovering the
+/// data is both safe and strictly better than that.
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match m.lock() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            log_error("a lock was poisoned by an earlier panic; recovering");
+            poisoned.into_inner()
+        }
+    }
+}
+
 static SHARED: OnceLock<Arc<Shared>> = OnceLock::new();
 
 fn shared() -> &'static Arc<Shared> {
@@ -310,7 +328,7 @@ fn engine_main(host: AndroidHost, sh: Arc<Shared>) {
         // Drain everything queued before this tick, so input and commands are
         // applied in order and the state machine sees the latest pen position.
         let cmds: Vec<Cmd> = {
-            let mut q = sh.cmds.lock().unwrap();
+            let mut q = lock(&sh.cmds);
             q.drain(..).collect()
         };
         for cmd in cmds {
@@ -320,7 +338,7 @@ fn engine_main(host: AndroidHost, sh: Arc<Shared>) {
                     // Stage the opening sheet at once. The UI has nothing to
                     // show until a frame arrives, and when the guide is drawn
                     // there may be no animation tick to produce one later.
-                    *sh.pixels.lock().unwrap() = Some(app.pixels().to_vec());
+                    *lock(&sh.pixels) = Some(app.pixels().to_vec());
                     host.request_repaint();
                 }
                 Cmd::Input(s) => app.push_input(s),
@@ -342,7 +360,7 @@ fn engine_main(host: AndroidHost, sh: Arc<Shared>) {
                 // Stage the finished page. The clone is what makes the handoff
                 // race-free: the UI thread takes a whole frame rather than
                 // sharing the engine's live buffer.
-                *sh.pixels.lock().unwrap() = Some(app.pixels().to_vec());
+                *lock(&sh.pixels) = Some(app.pixels().to_vec());
                 host.request_repaint();
             }
         }
@@ -365,7 +383,7 @@ pub extern "C" fn Java_com_stoutput_riddleandroid_DiaryView_nativeStart(
     _class: JClass,
 ) {
     let sh = shared();
-    sh.cmds.lock().unwrap().push_back(Cmd::Start);
+    lock(&sh.cmds).push_back(Cmd::Start);
     sh.ready.notify_all();
 }
 
@@ -394,7 +412,7 @@ pub extern "C" fn Java_com_stoutput_riddleandroid_DiaryView_nativeCopyPixels(
         Ok(l) if l > 0 => l as usize,
         _ => return 0,
     };
-    let pending: Option<Vec<u16>> = shared().pixels.lock().unwrap().take();
+    let pending: Option<Vec<u16>> = lock(&shared().pixels).take();
     let Some(src) = pending else { return 0 };
 
     let guard = match unsafe {
@@ -405,7 +423,7 @@ pub extern "C" fn Java_com_stoutput_riddleandroid_DiaryView_nativeCopyPixels(
             log_error(&format!("nativeCopyPixels: {e}"));
             // Put the frame back: dropping it would leave the view blank until
             // the next animation tick, and an idle page draws none.
-            *shared().pixels.lock().unwrap() = Some(src);
+            *lock(&shared().pixels) = Some(src);
             return 0;
         }
     };
@@ -444,7 +462,7 @@ pub extern "C" fn Java_com_stoutput_riddleandroid_DiaryView_nativeInput(
         touching: action == 0,
     };
     let sh = shared();
-    let mut q = sh.cmds.lock().unwrap();
+    let mut q = lock(&sh.cmds);
     q.push_back(Cmd::Input(sample));
     // A release is also pushed as an explicit pen-up so the ink stroke is
     // closed even if the release sample is filtered out upstream.
@@ -456,14 +474,14 @@ pub extern "C" fn Java_com_stoutput_riddleandroid_DiaryView_nativeInput(
 /// Make the diary forget every remembered page.
 #[no_mangle]
 pub extern "C" fn Java_com_stoutput_riddleandroid_DiaryView_nativeForget(_env: JNIEnv, _class: JClass) {
-    shared().cmds.lock().unwrap().push_back(Cmd::Forget);
+    lock(&shared().cmds).push_back(Cmd::Forget);
 }
 
 /// Stop the engine thread (called from `onDestroy`).
 #[no_mangle]
 pub extern "C" fn Java_com_stoutput_riddleandroid_DiaryView_nativeDestroy(_env: JNIEnv, _class: JClass) {
     let sh = shared();
-    sh.cmds.lock().unwrap().push_back(Cmd::Stop);
+    lock(&sh.cmds).push_back(Cmd::Stop);
     sh.running.store(false, Ordering::SeqCst);
     sh.ready.notify_all();
 }

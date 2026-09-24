@@ -227,6 +227,7 @@ impl HttpOracle {
         })?;
         let base = config::var_or("RIDDLE_OPENAI_BASE", "https://api.openai.com/v1");
         let base = base.trim_end_matches('/').to_string();
+        let base = require_https(&base)?;
         // A vision-capable default; overridable in settings.
         let model = config::var_or("RIDDLE_OPENAI_MODEL", "gpt-4o-mini");
         // Thinking models (Gemini 3.x, o-series…) count hidden reasoning
@@ -332,7 +333,7 @@ impl HttpOracle {
             let asked = std::time::Instant::now();
             let resp = match request("max_tokens") {
                 Err(ureq::Error::Status(400, r)) => {
-                    let detail = r.into_string().unwrap_or_default();
+                    let detail = response_excerpt(r);
                     if detail.contains("max_completion_tokens") {
                         eprintln!("riddle: endpoint wants max_completion_tokens; retrying");
                         request("max_completion_tokens")
@@ -347,8 +348,12 @@ impl HttpOracle {
             let reader = match resp {
                 Ok(r) => r.into_reader(),
                 Err(ureq::Error::Status(code, r)) => {
-                    let detail = r.into_string().unwrap_or_default();
-                    let _ = tx.send(Err(format!("http {code}: {}", detail.trim())));
+                    // Bounded on purpose: this string reaches the page and the
+                    // log, and it is a remote server's text. A proxy that
+                    // echoes request headers back would otherwise put the API
+                    // key on the page and in logcat.
+                    let detail = response_excerpt(r);
+                    let _ = tx.send(Err(format!("http {code}: {detail}")));
                     return;
                 }
                 Err(e) => {
@@ -399,6 +404,52 @@ fn sse_delta_content(s: &str) -> Option<String> {
     // the `"delta":` marker so we don't match a `content` elsewhere.
     let d = s.find("\"delta\"")?;
     json_str_field(&s[d..], "content")
+}
+
+/// Accept only an `https://` endpoint base, without its trailing slashes.
+///
+/// Every turn sends the API key *and* the writer's handwriting to this URL, so
+/// a typo or a stale bookmark must not be able to put both on the wire in the
+/// clear. Android blocks cleartext for this app as well, so an `http://`
+/// endpoint would otherwise fail opaquely at request time — failing here, with
+/// a reason, is far easier to act on.
+fn require_https(base: &str) -> std::io::Result<String> {
+    let trimmed = base.trim_end_matches('/');
+    if !trimmed.starts_with("https://") {
+        return Err(std::io::Error::other(format!(
+            "the endpoint must be an https:// URL, got {trimmed:?} — the diary \
+             would send your writing and API key unencrypted"
+        )));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// At most `MAX` bytes of an error response, for a message the writer sees.
+///
+/// The body is the endpoint's own text, so it is untrusted input that ends up
+/// on the page and in the log. Truncation keeps a huge HTML error page from
+/// filling the diary, and bounds how much of a misbehaving server's output is
+/// ever surfaced. (It also cannot contain the API key under any sane endpoint,
+/// but bounding it means a hostile one cannot choose to put it there at
+/// length.)
+const RESPONSE_EXCERPT_MAX: usize = 500;
+
+fn response_excerpt(resp: ureq::Response) -> String {
+    excerpt(&resp.into_string().unwrap_or_default())
+}
+
+/// The truncation itself, split out so it can be tested without a response.
+fn excerpt(body: &str) -> String {
+    let body = body.trim();
+    if body.len() <= RESPONSE_EXCERPT_MAX {
+        return body.to_string();
+    }
+    // Cut on a char boundary; the body may be UTF-8 from any locale.
+    let mut end = RESPONSE_EXCERPT_MAX;
+    while end > 0 && !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… (truncated)", &body[..end])
 }
 
 /// Trim and strip stray surrounding quotes from a reply fragment.
@@ -611,6 +662,44 @@ mod tests {
         assert_eq!(base64(b"fo"), "Zm8=");
         assert_eq!(base64(b"foo"), "Zm9v");
         assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn excerpt_bounds_a_hostile_or_huge_error_body() {
+        // Short bodies pass through so real provider errors stay readable.
+        assert_eq!(excerpt("  bad model  "), "bad model");
+        // A giant body (an HTML error page, say) is cut to something that can
+        // be written on a page and logged.
+        let huge = "x".repeat(50_000);
+        let got = excerpt(&huge);
+        assert!(got.len() <= RESPONSE_EXCERPT_MAX + 16, "not truncated: {}", got.len());
+        assert!(got.ends_with("(truncated)"));
+    }
+
+    #[test]
+    fn excerpt_cuts_on_a_char_boundary() {
+        // Multi-byte characters straddling the limit must not panic or produce
+        // invalid UTF-8 (the writer's language may not be English).
+        let body = "é".repeat(RESPONSE_EXCERPT_MAX);
+        let got = excerpt(&body);
+        assert!(got.is_char_boundary(got.len() - "(truncated)".len() - 1) || got.ends_with("(truncated)"));
+        assert!(std::str::from_utf8(got.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn only_https_endpoints_are_accepted() {
+        // The key and the writer's handwriting both go to this URL.
+        for scheme in ["http://example.test/v1", "ftp://x/v1", "example.test/v1", ""] {
+            assert!(require_https(scheme).is_err(), "{scheme:?} should be refused");
+        }
+        assert_eq!(
+            require_https("https://api.openai.com/v1/").unwrap(),
+            "https://api.openai.com/v1"
+        );
+        assert_eq!(
+            require_https("https://api.openai.com/v1").unwrap(),
+            "https://api.openai.com/v1"
+        );
     }
 
     #[test]
